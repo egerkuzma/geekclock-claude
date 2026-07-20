@@ -162,7 +162,7 @@ def fetch_org_id(session_key):
     resp = cffi_requests.get(
         "https://claude.ai/api/organizations",
         cookies={"sessionKey": session_key},
-        impersonate="chrome",
+        impersonate="safari18_0",
         timeout=15,
     )
     if resp.status_code != 200:
@@ -184,7 +184,7 @@ def fetch_claude_limits(session_key, org_id, cache_path, cache_ttl, max_fallback
         resp = cffi_requests.get(
             f"https://claude.ai/api/organizations/{org_id}/usage",
             cookies={"sessionKey": session_key},
-            impersonate="chrome",
+            impersonate="safari18_0",
             timeout=15,
         )
         if resp.status_code == 401:
