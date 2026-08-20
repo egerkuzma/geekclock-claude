@@ -194,3 +194,42 @@ def test_partial_payload_must_not_wipe_the_other_block(
     cache = json.loads(open(stale_good_cache).read())
     assert cache["five_hour_pct"] == 55      # свежий блок обновился
     assert cache["seven_day_pct"] == 7       # старый блок уцелел
+
+
+@pytest.fixture
+def cache_with_old_seven_day(tmp_path):
+    """Кеш, где недельный блок не обновлялся 13 часов, а пятичасовой свежий.
+
+    Метки времени поблочные: один mtime на файл не отличает эти два случая.
+    """
+    path = tmp_path / "cache.json"
+    now = time.time()
+    path.write_text(json.dumps({
+        "five_hour_pct": 42, "five_hour_resets_at": _iso_in(60),
+        "five_hour_fetched_at": now - 600,
+        "seven_day_pct": 7, "seven_day_resets_at": _iso_in(600),
+        "seven_day_fetched_at": now - 13 * 3600,
+    }))
+    os.utime(path, (now - 600, now - 600))
+    return str(path)
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "Поблочный мерж требует поблочных меток времени. Возраст берётся из "
+    "os.path.getmtime — один на весь файл, поэтому дописанный старый блок "
+    "выглядит свежим, и предохранитель на 12 часов его не выбросит."))
+def test_merged_block_expires_by_its_own_timestamp(
+        monkeypatch, cache_with_old_seven_day):
+    _patch_response(monkeypatch, _FakeResponse(200, {
+        "five_hour": {"utilization": 55, "resets_at": _iso_in(120)},
+    }))
+    out = gc.fetch_claude_limits(
+        "key", "org", cache_with_old_seven_day, 300, 43200)
+    assert out["five_hour_pct"] == 55
+    # Неделя не приходит 13 часов — честнее прочерк, чем бодрые 7%.
+    assert out["seven_day_pct"] is None
+
+    # И метка недельного блока не должна помолодеть от чужого успеха:
+    # сейчас поля просто нет, возраст один на файл.
+    cache = json.loads(open(cache_with_old_seven_day).read())
+    assert time.time() - cache["seven_day_fetched_at"] > 12 * 3600
