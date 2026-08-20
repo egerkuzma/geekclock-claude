@@ -125,8 +125,20 @@ def stale_good_cache(tmp_path):
 
 
 def _patch_response(monkeypatch, response):
-    monkeypatch.setattr(gc.cffi_requests, "get",
-                        lambda *a, **kw: response)
+    """Подменяет сетевой вызов и возвращает счётчик обращений.
+
+    Считаем снаружи, а не бросаем исключение внутри: fetch_claude_limits
+    обёрнут в except Exception и проглотил бы даже AssertionError, молча
+    уйдя в фолбэк, — проверка получилась бы декоративной.
+    """
+    calls = []
+
+    def _get(*a, **kw):
+        calls.append(kw.get("url") or (a[0] if a else None))
+        return response
+
+    monkeypatch.setattr(gc.cffi_requests, "get", _get)
+    return calls
 
 
 def test_http_500_falls_back_to_cache(monkeypatch, stale_good_cache):
@@ -169,15 +181,14 @@ def test_http_200_with_empty_body_must_not_poison_cache(
     "и следующий запуск в пределах TTL показывает на экране прочерки."))
 def test_next_run_after_empty_body_still_shows_data(
         monkeypatch, stale_good_cache):
-    _patch_response(monkeypatch, _FakeResponse(200, {}))
+    calls = _patch_response(monkeypatch, _FakeResponse(200, {}))
     gc.fetch_claude_limits("key", "org", stale_good_cache, 300, 43200)
+    assert len(calls) == 1
 
-    # Следующий запуск через минуту: кеш свежий, сети не касаемся вовсе.
-    def _boom(*a, **kw):
-        raise AssertionError("не должно быть запроса: кеш считается свежим")
-
-    monkeypatch.setattr(gc.cffi_requests, "get", _boom)
+    # Следующий запуск через минуту: кеш только что переписан, значит свежий,
+    # и в сеть мы уже не идём — на экран уходит то, что лежит в файле.
     out = gc.fetch_claude_limits("key", "org", stale_good_cache, 300, 43200)
+    assert len(calls) == 1, "второго запроса быть не должно: кеш свежий"
     assert out["five_hour_pct"] == 42
 
 
