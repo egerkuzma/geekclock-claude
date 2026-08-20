@@ -179,3 +179,18 @@ def test_next_run_after_empty_body_still_shows_data(
     monkeypatch.setattr(gc.cffi_requests, "get", _boom)
     out = gc.fetch_claude_limits("key", "org", stale_good_cache, 300, 43200)
     assert out["five_hour_pct"] == 42
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "Схема ломается по кускам: если из ответа пропадёт только seven_day, "
+    "проверка на полностью пустое тело не сработает, и в кеш ляжет "
+    "половина данных с затёртой неделей."))
+def test_partial_payload_must_not_wipe_the_other_block(
+        monkeypatch, stale_good_cache):
+    _patch_response(monkeypatch, _FakeResponse(200, {
+        "five_hour": {"utilization": 55, "resets_at": _iso_in(120)},
+    }))
+    gc.fetch_claude_limits("key", "org", stale_good_cache, 300, 43200)
+    cache = json.loads(open(stale_good_cache).read())
+    assert cache["five_hour_pct"] == 55      # свежий блок обновился
+    assert cache["seven_day_pct"] == 7       # старый блок уцелел
