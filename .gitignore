@@ -27,6 +27,6 @@ build/
 Thumbs.db
 
 # test previews and logs
-preview.png
+/preview.png
 *.log
 /tmp/geekclock_claude_cache.json
