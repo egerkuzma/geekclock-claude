@@ -228,6 +228,7 @@ geekclock-claude/
 ├── docs/
 │   ├── preview.png        # rendered image example
 │   └── clock-photo.jpg    # photo of the running device
+├── CHANGELOG.md
 ├── README.md
 └── LICENSE
 ```
@@ -246,6 +247,11 @@ This is an unofficial tool. It uses Claude.ai's internal web API
 endpoints which are not publicly documented and may change at any
 time. Using browser-based authentication may violate Anthropic's
 Terms of Service. Use at your own risk.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md). Current version: **1.1.0**
+(`./geekclock_claude.py --version`).
 
 ## License
 

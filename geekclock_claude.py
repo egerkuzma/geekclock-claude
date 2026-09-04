@@ -32,6 +32,8 @@ from curl_cffi import requests as cffi_requests
 from PIL import Image, ImageDraw, ImageFont
 
 
+__version__ = "1.1.0"   # keep in sync with CHANGELOG.md
+
 # --- defaults ---
 DEFAULT_CACHE_PATH = "/tmp/geekclock_claude_cache.json"
 DEFAULT_CACHE_TTL = 300              # 5 minutes
@@ -628,6 +630,9 @@ def load_session_key(path):
 def main():
     parser = argparse.ArgumentParser(
         description="Push Claude.ai usage limits to GeekMagic SmallTV clock"
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}",
     )
     parser.add_argument(
         "--session-key", "-k",
