@@ -23,6 +23,7 @@ import json
 import os
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 
 import requests
@@ -34,6 +35,7 @@ from PIL import Image, ImageDraw, ImageFont
 DEFAULT_CACHE_PATH = "/tmp/geekclock_claude_cache.json"
 DEFAULT_CACHE_TTL = 300              # 5 minutes
 DEFAULT_CACHE_MAX_FALLBACK = 43200   # 12 hours; older cache is discarded
+EXIT_INTERNAL_ERROR = 2              # exit code when our own parsing failed
 
 # --- palette ---
 COL_BG = (0, 0, 0)
@@ -100,27 +102,73 @@ def _format_reset_long(minutes):
 
 
 # ====== cache ======
+#
+# Cache file layout (per-block timestamps):
+#   {
+#     "five_hour_pct": 42, "five_hour_resets_at": "...", "five_hour_fetched_at": 1.7e9,
+#     "seven_day_pct": 7,  "seven_day_resets_at": "...", "seven_day_fetched_at": 1.7e9
+#   }
+# A block missing from an API response keeps its previous value and its
+# own fetched_at, so a partial or empty payload never wipes good data.
+# Blocks older than max_fallback are hidden on read, independently.
+
+BLOCKS = ("five_hour", "seven_day")
+
+
+class InternalError(Exception):
+    """A bug in our own response parsing (as opposed to claude.ai being
+    unreachable). Carries the best available fallback data in `limits`
+    (or None) so the caller can still render something, while signalling
+    the failure via a non-zero exit code."""
+
+    def __init__(self, cause, limits=None):
+        super().__init__(f"{type(cause).__name__}: {cause}")
+        self.cause = cause
+        self.limits = limits
+
 
 def _build_result_from_api_data(data):
     """Extract the fields we care about from the API response.
     We store ISO timestamps verbatim; reset-minutes are recomputed on read
     so cached entries always show fresh countdowns."""
-    return {
-        "five_hour_pct": (data.get("five_hour") or {}).get("utilization"),
-        "five_hour_resets_at": (data.get("five_hour") or {}).get("resets_at"),
-        "seven_day_pct": (data.get("seven_day") or {}).get("utilization"),
-        "seven_day_resets_at": (data.get("seven_day") or {}).get("resets_at"),
-    }
+    if not isinstance(data, dict):
+        data = {}
+    result = {}
+    for block in BLOCKS:
+        entry = data.get(block) or {}
+        if not isinstance(entry, dict):
+            entry = {}
+        pct = entry.get("utilization")
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            pct = None
+        result[f"{block}_pct"] = pct
+        result[f"{block}_resets_at"] = entry.get("resets_at")
+    return result
 
 
-def _add_computed_fields(result):
-    """Add freshly computed reset-minutes from stored ISO timestamps."""
-    if result is None:
-        return None
-    out = dict(result)
-    out["five_hour_resets_in_min"] = _parse_resets_at(result.get("five_hour_resets_at"))
-    out["seven_day_resets_in_min"] = _parse_resets_at(result.get("seven_day_resets_at"))
-    return out
+def _merge_cache(cached, age, fresh, now=None):
+    """Combine a fresh API result with the previous cache, block by block.
+    A block present in `fresh` gets fetched_at=now; a block absent from
+    `fresh` is carried over from `cached` with its own fetched_at (falling
+    back to the file mtime for legacy caches without per-block stamps)."""
+    now = time.time() if now is None else now
+    cached = cached or {}
+    legacy_stamp = now - age if age is not None else now
+    merged = {}
+    for block in BLOCKS:
+        if fresh.get(f"{block}_pct") is not None:
+            merged[f"{block}_pct"] = fresh[f"{block}_pct"]
+            merged[f"{block}_resets_at"] = fresh.get(f"{block}_resets_at")
+            merged[f"{block}_fetched_at"] = now
+        elif cached.get(f"{block}_pct") is not None:
+            merged[f"{block}_pct"] = cached[f"{block}_pct"]
+            merged[f"{block}_resets_at"] = cached.get(f"{block}_resets_at")
+            merged[f"{block}_fetched_at"] = cached.get(
+                f"{block}_fetched_at", legacy_stamp)
+        else:
+            merged[f"{block}_pct"] = None
+            merged[f"{block}_resets_at"] = None
+    return merged
 
 
 def _load_cache(path):
@@ -130,7 +178,10 @@ def _load_cache(path):
             return None, None
         age = int(time.time() - os.path.getmtime(path))
         with open(path, "r") as f:
-            return json.load(f), age
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None, None
+        return data, age
     except Exception:
         return None, None
 
@@ -146,13 +197,35 @@ def _save_cache(path, result):
         print(f"[cache] save failed: {e}", file=sys.stderr)
 
 
-def _fallback_cache(cached, age, max_age):
-    """Return cached data only if it's fresh enough to be useful.
-    Stale cache (>max_age seconds) is discarded so we don't display
-    misleading values for days when the API is unreachable."""
-    if cached is None or age is None or age > max_age:
+def _fallback_cache(cached, age, max_age, now=None):
+    """Turn a cache dict into display data, honouring per-block age.
+
+    Each block is shown only if it is younger than max_age seconds
+    (by its own fetched_at, or the file age for legacy caches); older
+    blocks come out as None so we don't display misleading values for
+    days when the API is unreachable. Reset-minutes are recomputed from
+    the stored ISO timestamps so countdowns stay accurate.
+    Returns None when no block has usable data."""
+    if cached is None or age is None:
         return None
-    return _add_computed_fields(cached)
+    now = time.time() if now is None else now
+    out = {}
+    any_data = False
+    for block in BLOCKS:
+        pct = cached.get(f"{block}_pct")
+        fetched_at = cached.get(f"{block}_fetched_at")
+        block_age = (now - fetched_at) if fetched_at is not None else age
+        if pct is None or block_age > max_age:
+            out[f"{block}_pct"] = None
+            out[f"{block}_resets_at"] = None
+            out[f"{block}_resets_in_min"] = None
+            continue
+        any_data = True
+        resets_at = cached.get(f"{block}_resets_at")
+        out[f"{block}_pct"] = pct
+        out[f"{block}_resets_at"] = resets_at
+        out[f"{block}_resets_in_min"] = _parse_resets_at(resets_at)
+    return out if any_data else None
 
 
 # ====== claude.ai API ======
@@ -174,12 +247,18 @@ def fetch_org_id(session_key):
 
 
 def fetch_claude_limits(session_key, org_id, cache_path, cache_ttl, max_fallback):
-    """Fetch usage limits from claude.ai, with caching and graceful fallback
-    on errors (401/403/429 -> serve last cached value if not too old)."""
+    """Fetch usage limits from claude.ai, with caching and graceful fallback.
+
+    Anything that goes wrong on the network / on claude.ai's side
+    (connection errors, 401/403/429/5xx, non-JSON body) falls back to the
+    last cached value if it is not too old. A failure inside our own
+    parsing raises InternalError (with the same fallback attached) so it
+    is not mistaken for an outage."""
     cached, age = _load_cache(cache_path)
     if cached is not None and age is not None and age < cache_ttl:
-        return _add_computed_fields(cached)
+        return _fallback_cache(cached, age, max_fallback)
 
+    # --- their side: network + HTTP status + JSON decoding ---
     try:
         resp = cffi_requests.get(
             f"https://claude.ai/api/organizations/{org_id}/usage",
@@ -201,13 +280,27 @@ def fetch_claude_limits(session_key, org_id, cache_path, cache_ttl, max_fallback
             print(f"[claude] HTTP {resp.status_code}: {resp.text[:200]}",
                   file=sys.stderr)
             return _fallback_cache(cached, age, max_fallback)
-
-        result = _build_result_from_api_data(resp.json())
-        _save_cache(cache_path, result)
-        return _add_computed_fields(result)
+        data = resp.json()
     except Exception as e:
         print(f"[claude] {type(e).__name__}: {e}", file=sys.stderr)
-    return _fallback_cache(cached, age, max_fallback)
+        return _fallback_cache(cached, age, max_fallback)
+
+    # --- our side: parsing and merging. A bug here must not look like
+    # an outage, so it is reported via InternalError instead of a silent
+    # fallback. The cache is not touched on this path.
+    try:
+        fresh = _build_result_from_api_data(data)
+        merged = _merge_cache(cached, age, fresh)
+    except Exception as e:
+        raise InternalError(e, limits=_fallback_cache(cached, age, max_fallback)) from e
+
+    missing = [b for b in BLOCKS if fresh.get(f"{b}_pct") is None]
+    if missing:
+        print(f"[claude] HTTP 200 but no usable data for: {', '.join(missing)}; "
+              f"keeping cached values", file=sys.stderr)
+
+    _save_cache(cache_path, merged)
+    return _fallback_cache(merged, 0, max_fallback)
 
 
 # ====== rendering ======
@@ -446,11 +539,22 @@ def main():
             print(f"error: cannot detect org id: {e}", file=sys.stderr)
             sys.exit(1)
 
-    # Fetch limits (with caching/fallback) and render.
-    limits = fetch_claude_limits(
-        session_key, org_id,
-        args.cache_path, args.cache_ttl, DEFAULT_CACHE_MAX_FALLBACK,
-    )
+    # Fetch limits (with caching/fallback) and render. A bug in our own
+    # parsing still renders whatever fallback data is available, but the
+    # run exits non-zero so it is visible in cron logs / monitoring.
+    exit_code = 0
+    try:
+        limits = fetch_claude_limits(
+            session_key, org_id,
+            args.cache_path, args.cache_ttl, DEFAULT_CACHE_MAX_FALLBACK,
+        )
+    except InternalError as e:
+        print(f"error: internal failure while parsing usage response: {e}",
+              file=sys.stderr)
+        traceback.print_exception(
+            type(e.cause), e.cause, e.cause.__traceback__, file=sys.stderr)
+        limits = e.limits
+        exit_code = EXIT_INTERNAL_ERROR
     img = create_image(limits)
 
     if args.output:
@@ -469,6 +573,8 @@ def main():
         else:
             cl_str = "no data"
         print(f"[{datetime.now():%H:%M:%S}] {cl_str}, uploaded={ok}")
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

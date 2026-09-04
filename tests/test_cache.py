@@ -1,8 +1,8 @@
 """Тесты на разбор времени сброса и на кеш.
 
-Главное здесь — test_http_200_with_empty_body_must_not_poison_cache:
-он падает на текущем коде и помечен xfail(strict=True). Остальные тесты
-фиксируют поведение, которое сейчас корректно, чтобы его не сломать.
+Кеш поблочный: у five_hour и seven_day свои метки fetched_at. Пустой или
+частичный ответ с HTTP 200 не затирает старые блоки, а протухание
+считается по метке блока, а не по mtime файла.
 """
 
 import json
@@ -91,8 +91,9 @@ def test_build_result_from_valid_payload():
 
 
 def test_build_result_from_empty_payload_is_all_none():
-    # Пустой/изменившийся ответ молча превращается в словарь из None —
-    # исключения нет, и вызывающий код не может отличить его от данных.
+    # Пустой/изменившийся ответ превращается в словарь из None;
+    # fetch_claude_limits трактует None-блок как «не пришёл» и оставляет
+    # в кеше прежнее значение этого блока.
     assert gc._build_result_from_api_data({}) == {
         "five_hour_pct": None, "five_hour_resets_at": None,
         "seven_day_pct": None, "seven_day_resets_at": None,
@@ -164,11 +165,6 @@ def test_http_200_updates_cache(monkeypatch, stale_good_cache):
     assert json.loads(open(stale_good_cache).read())["five_hour_pct"] == 55
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "Известный баг: HTTP 200 с пустым или изменившимся телом даёт словарь "
-    "из None, который _save_cache кладёт поверх рабочего кеша. Данные "
-    "теряются безвозвратно, а не на 12 часов: свежий mtime заставляет "
-    "_load_cache отдавать пустышку как валидную, и фолбэк не срабатывает."))
 def test_http_200_with_empty_body_must_not_poison_cache(
         monkeypatch, stale_good_cache):
     _patch_response(monkeypatch, _FakeResponse(200, {}))
@@ -176,9 +172,6 @@ def test_http_200_with_empty_body_must_not_poison_cache(
     assert json.loads(open(stale_good_cache).read())["five_hour_pct"] == 42
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "Следствие того же бага: после отравления кеш выглядит свежим, "
-    "и следующий запуск в пределах TTL показывает на экране прочерки."))
 def test_next_run_after_empty_body_still_shows_data(
         monkeypatch, stale_good_cache):
     calls = _patch_response(monkeypatch, _FakeResponse(200, {}))
@@ -192,10 +185,6 @@ def test_next_run_after_empty_body_still_shows_data(
     assert out["five_hour_pct"] == 42
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "Схема ломается по кускам: если из ответа пропадёт только seven_day, "
-    "проверка на полностью пустое тело не сработает, и в кеш ляжет "
-    "половина данных с затёртой неделей."))
 def test_partial_payload_must_not_wipe_the_other_block(
         monkeypatch, stale_good_cache):
     _patch_response(monkeypatch, _FakeResponse(200, {
@@ -225,10 +214,6 @@ def cache_with_old_seven_day(tmp_path):
     return str(path)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "Поблочный мерж требует поблочных меток времени. Возраст берётся из "
-    "os.path.getmtime — один на весь файл, поэтому дописанный старый блок "
-    "выглядит свежим, и предохранитель на 12 часов его не выбросит."))
 def test_merged_block_expires_by_its_own_timestamp(
         monkeypatch, cache_with_old_seven_day):
     _patch_response(monkeypatch, _FakeResponse(200, {
@@ -240,7 +225,6 @@ def test_merged_block_expires_by_its_own_timestamp(
     # Неделя не приходит 13 часов — честнее прочерк, чем бодрые 7%.
     assert out["seven_day_pct"] is None
 
-    # И метка недельного блока не должна помолодеть от чужого успеха:
-    # сейчас поля просто нет, возраст один на файл.
+    # И метка недельного блока не должна помолодеть от чужого успеха.
     cache = json.loads(open(cache_with_old_seven_day).read())
     assert time.time() - cache["seven_day_fetched_at"] > 12 * 3600
