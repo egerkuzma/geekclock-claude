@@ -458,7 +458,9 @@ BLOCKS_TOP = 40          # first block y (below the header)
 BLOCKS_BOTTOM = 226      # last block must end above this line; the SmallTV
                          # panel clips the bottom ~10 px of the 240 px image
 SIDE = 10                # left/right margin
+PCT_SIGN_GAP = 4         # ink gap between the digits and the "%" sign, px
 HEADER_CY = 18           # vertical centre of the header row (mascot centre)
+MASCOT_X = 12            # mascot left edge (its arms); body starts 4 px further right
 
 
 def _blocks_to_draw(limits):
@@ -486,6 +488,37 @@ def _blocks_to_draw(limits):
     return blocks
 
 
+def _ink_bbox(text, font):
+    """Actual rendered ink box of `text` drawn at (0, baseline) with the
+    baseline at y=font.size*2: (left, top, right, bottom) or None.
+    Font metrics from textbbox include side bearings and rounding; for
+    pixel-exact spacing we look at the pixels themselves."""
+    size = font.size
+    scratch = Image.new("L", (size * 12, size * 3), 0)
+    ImageDraw.Draw(scratch).text((0, size * 2), text, fill=255,
+                                 font=font, anchor="ls")
+    return scratch.point(lambda v: 255 if v > 200 else 0).getbbox()
+
+
+def _draw_pct(draw, x, baseline, text, font):
+    """Draw "NN%" with the "%" sign placed a fixed ink distance after the
+    digits. Font kerning makes pairs like "7%" sit tighter than "4%";
+    placing the sign by measured ink edges keeps the gap identical in
+    every block."""
+    if not text.endswith("%"):
+        draw.text((x, baseline), text, fill=COL_TEXT, font=font, anchor="ls")
+        return
+    digits = text[:-1]
+    draw.text((x, baseline), digits, fill=COL_TEXT, font=font, anchor="ls")
+    digits_ink = _ink_bbox(digits, font)
+    sign_ink = _ink_bbox("%", font)
+    if not digits_ink or not sign_ink:
+        draw.text((x, baseline), "%", fill=COL_TEXT, font=font, anchor="ls")
+        return
+    sign_x = x + digits_ink[2] + PCT_SIGN_GAP - sign_ink[0]
+    draw.text((sign_x, baseline), "%", fill=COL_TEXT, font=font, anchor="ls")
+
+
 def _text_height(draw, text, font):
     bb = draw.textbbox((0, 0), text, font=font, anchor="ls")
     return bb[3] - bb[1]
@@ -503,7 +536,7 @@ def create_image(limits):
     # Text is centred on the mascot's vertical middle by cap height so the
     # title and the clock line up with the sprite (scale 2 -> 20 px tall,
     # drawn at y=8, centre at HEADER_CY).
-    _draw_pixel_monster(draw, 8, HEADER_CY - 10, scale=2)
+    _draw_pixel_monster(draw, MASCOT_X, HEADER_CY - 10, scale=2)
 
     title = "Usage"
     ink = draw.textbbox((0, 0), title, font=f_title, anchor="ls")
@@ -551,8 +584,7 @@ def create_image(limits):
         yi = int(round(y))
         pct = b["pct"]
         pct_text = f"{int(pct)}%" if pct is not None else "—"
-        draw.text((SIDE, yi + pct_h), pct_text, fill=COL_TEXT,
-                  font=f_pct, anchor="ls")
+        _draw_pct(draw, SIDE, yi + pct_h, pct_text, f_pct)
         _draw_pill(draw, W - pill_min_width - SIDE, yi + L["pill_dy"],
                    b["title"], f_pill, min_width=pill_min_width)
         _draw_rounded_bar(draw, SIDE, yi + bar_dy, W - 2 * SIDE, L["bar_h"],
