@@ -445,11 +445,13 @@ def _draw_pill(draw, x, y, text, font, padding_x=10, padding_y=5, min_width=0):
 #   bar_to_reset: gap between the bar and the "Resets in" line.
 LAYOUT_ROOMY = dict(f_pct=44, f_pill=13, f_meta=15, pill_dy=12,
                     pct_to_bar=12, bar_h=16, bar_to_reset=6)
-LAYOUT_COMPACT = dict(f_pct=30, f_pill=12, f_meta=12, pill_dy=4,
+LAYOUT_COMPACT = dict(f_pct=26, f_pill=12, f_meta=12, pill_dy=2,
                       pct_to_bar=10, bar_h=12, bar_to_reset=5)
 BLOCKS_TOP = 40          # first block y (below the header)
-BLOCKS_BOTTOM = 236      # last block must end above this line
+BLOCKS_BOTTOM = 226      # last block must end above this line; the SmallTV
+                         # panel clips the bottom ~10 px of the 240 px image
 SIDE = 10                # left/right margin
+HEADER_CY = 18           # vertical centre of the header row (mascot centre)
 
 
 def _blocks_to_draw(limits):
@@ -491,16 +493,22 @@ def create_image(limits):
     f_tiny = _load_first_available_font(FONT_CANDIDATES_REGULAR, 12)
 
     # Header: mascot on the left, "Usage" centered, time on the right.
-    _draw_pixel_monster(draw, 8, 8, scale=2)
+    # Text is centred on the mascot's vertical middle by cap height so the
+    # title and the clock line up with the sprite (scale 2 -> 20 px tall,
+    # drawn at y=8, centre at HEADER_CY).
+    _draw_pixel_monster(draw, 8, HEADER_CY - 10, scale=2)
 
     title = "Usage"
-    bbox = draw.textbbox((0, 0), title, font=f_title)
-    tw = bbox[2] - bbox[0]
-    draw.text(((W - tw) // 2, 6), title, fill=COL_TEXT, font=f_title)
+    ink = draw.textbbox((0, 0), title, font=f_title, anchor="ls")
+    cap_h = _text_height(draw, "H", f_title)
+    draw.text(((W - (ink[2] - ink[0])) // 2 - ink[0], HEADER_CY + cap_h // 2),
+              title, fill=COL_TEXT, font=f_title, anchor="ls")
 
     now = datetime.now().strftime("%H:%M")
-    bbox = draw.textbbox((0, 0), now, font=f_tiny)
-    draw.text((W - bbox[2] - 8, 12), now, fill=COL_DIM, font=f_tiny)
+    ink = draw.textbbox((0, 0), now, font=f_tiny, anchor="ls")
+    cap_h = _text_height(draw, "0", f_tiny)
+    draw.text((W - 8 - ink[2], HEADER_CY + cap_h // 2),
+              now, fill=COL_DIM, font=f_tiny, anchor="ls")
 
     if limits is None:
         draw.text((10, 110), "NO DATA", fill=COL_BAR_RED, font=f_title)
