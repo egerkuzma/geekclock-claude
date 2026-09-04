@@ -55,6 +55,13 @@ FONT_CANDIDATES_BOLD = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/Library/Fonts/Helvetica.ttc",
 ]
+FONT_CANDIDATES_PCT = [          # the big percent numbers: heaviest weight available
+    "/usr/share/fonts/opentype/inter/Inter-Black.otf",
+    "/usr/share/fonts/opentype/inter/Inter-ExtraBold.otf",
+    "/usr/share/fonts/opentype/inter/Inter-Bold.otf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/Library/Fonts/Helvetica.ttc",
+]
 FONT_CANDIDATES_SEMIBOLD = [
     "/usr/share/fonts/opentype/inter/Inter-SemiBold.otf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -516,7 +523,7 @@ def create_image(limits):
 
     blocks = _blocks_to_draw(limits)
     L = LAYOUT_COMPACT if len(blocks) > 2 else LAYOUT_ROOMY
-    f_pct = _load_first_available_font(FONT_CANDIDATES_BOLD, L["f_pct"])
+    f_pct = _load_first_available_font(FONT_CANDIDATES_PCT, L["f_pct"])
     f_meta = _load_first_available_font(FONT_CANDIDATES_SEMIBOLD, L["f_meta"])
     f_pill = _load_first_available_font(FONT_CANDIDATES_SEMIBOLD, L["f_pill"])
 
