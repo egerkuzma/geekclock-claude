@@ -166,6 +166,12 @@ a minute-by-minute cron only one in five runs actually hits the API.
 The countdown texts ("Resets in 4h 37m") are recalculated from cached
 data on every run, so they tick down accurately.
 
+The cache is kept per block: the 5-hour and weekly values each carry
+their own timestamp. If the API answers with an empty or partial body,
+the missing block keeps its last known value instead of being wiped.
+A block older than 12 hours is hidden (shown as "—") rather than
+displayed as if it were current.
+
 To change cache TTL:
 
 ```bash
@@ -190,6 +196,12 @@ may keep happening — running on your home network or NAS usually works.
 You (or another client with the same account) are polling too
 frequently. Increase `--cache-ttl` or lower cron frequency.
 
+**Exit code 2 and a traceback in the log**
+The API answered, but our own parsing of the response failed (most
+likely the response format changed). The script still renders the last
+cached values and uploads them, but exits non-zero so the failure is
+visible. Please open an issue with the traceback.
+
 **Image uploads but clock doesn't change**
 Some GeekMagic firmwares require you to pick the image as the active
 wallpaper in the official app once. After that, overwriting the file
@@ -204,6 +216,8 @@ Install dependencies: `pip install -r requirements.txt`.
 geekclock-claude/
 ├── geekclock_claude.py    # the script
 ├── requirements.txt       # Python deps
+├── requirements-dev.txt   # test deps (pytest)
+├── tests/                 # pytest suite: run `python -m pytest`
 ├── .env.example           # config template
 ├── docs/
 │   ├── preview.png        # rendered image example
