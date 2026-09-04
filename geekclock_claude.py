@@ -417,46 +417,69 @@ def _draw_rounded_bar(draw, x, y, w, h, pct, color):
 
 def _draw_pill(draw, x, y, text, font, padding_x=10, padding_y=5, min_width=0):
     """Rounded rectangle with centered text inside.
-    min_width lets multiple pills (Current/Weekly) match in size."""
-    bbox = draw.textbbox((0, 0), text, font=font)
-    tw = bbox[2] - bbox[0]
-    th = bbox[3] - bbox[1]
-    text_top_offset = bbox[1]
+
+    Height is derived from the font's cap height (not from the word's own
+    ink box), so a word with a descender ("Weekly") gets the same pill as
+    one without ("Current") and its letters sit visually centred.
+    min_width lets multiple pills match in size."""
+    cap = draw.textbbox((0, 0), "H", font=font, anchor="ls")
+    cap_h = cap[3] - cap[1]            # baseline-relative: bbox[1] is negative
+    ink = draw.textbbox((0, 0), text, font=font, anchor="ls")
+    tw = ink[2] - ink[0]
 
     w = max(tw + padding_x * 2, min_width)
-    h = th + padding_y * 2
+    h = cap_h + padding_y * 2
     radius = h // 2
     draw.rounded_rectangle([x, y, x + w, y + h], radius=radius, fill=COL_PILL_BG)
-    text_x = x + (w - tw) // 2 - bbox[0]
-    text_y = y + (h - th) // 2 - text_top_offset
-    draw.text((text_x, text_y), text, fill=COL_PILL_TEXT, font=font)
+    text_x = x + (w - tw) // 2 - ink[0]
+    baseline = y + padding_y + cap_h
+    draw.text((text_x, baseline), text, fill=COL_PILL_TEXT, font=font, anchor="ls")
     return w, h
 
 
-# Two layout presets: the roomy one for two blocks (5h + weekly) and a
-# compact one that fits a third per-model block (e.g. Fable) on 240x240.
-# Each preset: (first block y, block pitch, pct font, pill font, meta font,
-#               pill y offset, bar y offset, bar height, reset text y offset)
-LAYOUT_ROOMY = dict(top=42, pitch=93, f_pct=44, f_pill=13, f_meta=15,
-                    pill_dy=12, bar_dy=48, bar_h=16, reset_dy=68)
-LAYOUT_COMPACT = dict(top=42, pitch=66, f_pct=30, f_pill=12, f_meta=12,
-                      pill_dy=2, bar_dy=30, bar_h=12, reset_dy=46)
+# Layout presets. Blocks are flowed top-to-bottom; whatever vertical space
+# is left after all blocks is spread evenly between them, so the screen is
+# filled edge to edge regardless of how many blocks / reset lines there are.
+#   f_pct/f_pill/f_meta: font sizes; pill_dy: pill offset from block top;
+#   pct_to_bar: gap between the percent text and the bar; bar_h: bar height;
+#   bar_to_reset: gap between the bar and the "Resets in" line.
+LAYOUT_ROOMY = dict(f_pct=44, f_pill=13, f_meta=15, pill_dy=12,
+                    pct_to_bar=12, bar_h=16, bar_to_reset=6)
+LAYOUT_COMPACT = dict(f_pct=30, f_pill=12, f_meta=12, pill_dy=4,
+                      pct_to_bar=10, bar_h=12, bar_to_reset=5)
+BLOCKS_TOP = 40          # first block y (below the header)
+BLOCKS_BOTTOM = 236      # last block must end above this line
+SIDE = 10                # left/right margin
 
 
 def _blocks_to_draw(limits):
-    """[(title, pct, resets_in_min), ...] in display order. The per-model
-    weekly block is only included when the API actually reported one."""
+    """Blocks in display order: dicts with title, pct, reset_min, group.
+    The per-model weekly block is only included when the API reported one.
+    The "Resets in" line is drawn once per reset group, under the last
+    block of that group: weekly limits (all models / Fable) reset together."""
     blocks = [
-        ("Current", limits.get("five_hour_pct"),
-         limits.get("five_hour_resets_in_min")),
-        ("Weekly", limits.get("seven_day_pct"),
-         limits.get("seven_day_resets_in_min")),
+        dict(title="Current", group="session",
+             pct=limits.get("five_hour_pct"),
+             reset_min=limits.get("five_hour_resets_in_min")),
+        dict(title="Weekly", group="weekly",
+             pct=limits.get("seven_day_pct"),
+             reset_min=limits.get("seven_day_resets_in_min")),
     ]
     if limits.get("model_weekly_pct") is not None:
-        blocks.append((limits.get("model_weekly_label") or "Model",
-                       limits.get("model_weekly_pct"),
-                       limits.get("model_weekly_resets_in_min")))
+        blocks.append(dict(title=limits.get("model_weekly_label") or "Model",
+                           group="weekly",
+                           pct=limits.get("model_weekly_pct"),
+                           reset_min=limits.get("model_weekly_resets_in_min")))
+    last_in_group = {b["group"]: i for i, b in enumerate(blocks)}
+    for i, b in enumerate(blocks):
+        b["show_reset"] = (last_in_group[b["group"]] == i
+                           and bool(_format_reset_long(b["reset_min"])))
     return blocks
+
+
+def _text_height(draw, text, font):
+    bb = draw.textbbox((0, 0), text, font=font, anchor="ls")
+    return bb[3] - bb[1]
 
 
 def create_image(limits):
@@ -464,20 +487,20 @@ def create_image(limits):
     img = Image.new("RGB", (W, H), color=COL_BG)
     draw = ImageDraw.Draw(img)
 
-    f_title = _load_first_available_font(FONT_CANDIDATES_TITLE, 32)
+    f_title = _load_first_available_font(FONT_CANDIDATES_TITLE, 24)
     f_tiny = _load_first_available_font(FONT_CANDIDATES_REGULAR, 12)
 
     # Header: mascot on the left, "Usage" centered, time on the right.
-    _draw_pixel_monster(draw, 6, 6, scale=3)
+    _draw_pixel_monster(draw, 8, 8, scale=2)
 
     title = "Usage"
     bbox = draw.textbbox((0, 0), title, font=f_title)
     tw = bbox[2] - bbox[0]
-    draw.text(((W - tw) // 2, 2), title, fill=COL_TEXT, font=f_title)
+    draw.text(((W - tw) // 2, 6), title, fill=COL_TEXT, font=f_title)
 
     now = datetime.now().strftime("%H:%M")
     bbox = draw.textbbox((0, 0), now, font=f_tiny)
-    draw.text((W - bbox[2] - 8, 16), now, fill=COL_DIM, font=f_tiny)
+    draw.text((W - bbox[2] - 8, 12), now, fill=COL_DIM, font=f_tiny)
 
     if limits is None:
         draw.text((10, 110), "NO DATA", fill=COL_BAR_RED, font=f_title)
@@ -491,22 +514,39 @@ def create_image(limits):
 
     # Shared pill width so all labels (Current/Weekly/Fable) match.
     pill_min_width = 0
-    for title, _, _ in blocks:
-        bb = draw.textbbox((0, 0), title, font=f_pill)
+    for b in blocks:
+        bb = draw.textbbox((0, 0), b["title"], font=f_pill, anchor="ls")
         pill_min_width = max(pill_min_width, (bb[2] - bb[0]) + 20)
 
-    for i, (title, pct, reset_min) in enumerate(blocks):
-        y = L["top"] + i * L["pitch"]
+    # Vertical flow: measure every block, spread the leftover evenly.
+    pct_h = _text_height(draw, "100%", f_pct)
+    meta_h = _text_height(draw, "Resets in 0d 0h", f_meta)
+    bar_dy = pct_h + L["pct_to_bar"]
+    heights = []
+    for b in blocks:
+        h = bar_dy + L["bar_h"]
+        if b["show_reset"]:
+            h += L["bar_to_reset"] + meta_h
+        heights.append(h)
+    leftover = BLOCKS_BOTTOM - BLOCKS_TOP - sum(heights)
+    gap = leftover / (len(blocks) - 1) if len(blocks) > 1 else 0
+
+    y = BLOCKS_TOP
+    for b, h in zip(blocks, heights):
+        yi = int(round(y))
+        pct = b["pct"]
         pct_text = f"{int(pct)}%" if pct is not None else "—"
-        draw.text((10, y), pct_text, fill=COL_TEXT, font=f_pct)
-        _draw_pill(draw, W - pill_min_width - 10, y + L["pill_dy"],
-                   title, f_pill, min_width=pill_min_width)
-        _draw_rounded_bar(draw, 10, y + L["bar_dy"], W - 20, L["bar_h"],
+        draw.text((SIDE, yi + pct_h), pct_text, fill=COL_TEXT,
+                  font=f_pct, anchor="ls")
+        _draw_pill(draw, W - pill_min_width - SIDE, yi + L["pill_dy"],
+                   b["title"], f_pill, min_width=pill_min_width)
+        _draw_rounded_bar(draw, SIDE, yi + bar_dy, W - 2 * SIDE, L["bar_h"],
                           pct, _color_for_pct(pct))
-        reset = _format_reset_long(reset_min)
-        if reset:
-            draw.text((10, y + L["reset_dy"]), reset,
-                      fill=COL_TEXT, font=f_meta)
+        if b["show_reset"]:
+            reset_y = yi + bar_dy + L["bar_h"] + L["bar_to_reset"]
+            draw.text((SIDE, reset_y + meta_h), _format_reset_long(b["reset_min"]),
+                      fill=COL_TEXT, font=f_meta, anchor="ls")
+        y += h + gap
 
     return img
 

@@ -141,7 +141,10 @@ def test_three_blocks_use_compact_layout():
               "seven_day_pct": 27, "seven_day_resets_in_min": 3000,
               "model_weekly_pct": 32, "model_weekly_resets_in_min": 3000,
               "model_weekly_label": "Fable"}
-    assert [b[0] for b in gc._blocks_to_draw(limits)] == ["Current", "Weekly", "Fable"]
+    blocks = gc._blocks_to_draw(limits)
+    assert [b["title"] for b in blocks] == ["Current", "Weekly", "Fable"]
+    # Weekly limits reset together: the line is drawn once, under Fable.
+    assert [b["show_reset"] for b in blocks] == [True, False, True]
     img = gc.create_image(limits)
     assert img.size == (240, 240)
     # The bottom block must fit entirely on screen: the last pixel row is empty.
@@ -153,10 +156,22 @@ def test_two_blocks_keep_roomy_layout():
     limits = {"five_hour_pct": 37, "five_hour_resets_in_min": 90,
               "seven_day_pct": 27, "seven_day_resets_in_min": 3000,
               "model_weekly_pct": None}
-    assert [b[0] for b in gc._blocks_to_draw(limits)] == ["Current", "Weekly"]
+    blocks = gc._blocks_to_draw(limits)
+    assert [b["title"] for b in blocks] == ["Current", "Weekly"]
+    assert [b["show_reset"] for b in blocks] == [True, True]
     assert gc.create_image(limits).size == (240, 240)
 
 
 def test_model_block_without_label_gets_generic_title():
     limits = {"five_hour_pct": 1, "seven_day_pct": 1, "model_weekly_pct": 5}
-    assert gc._blocks_to_draw(limits)[2][0] == "Model"
+    assert gc._blocks_to_draw(limits)[2]["title"] == "Model"
+
+
+def test_pills_have_equal_height_regardless_of_descenders():
+    """"Weekly" has a descender, "Current" does not: pills must still match."""
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", (240, 240)); draw = ImageDraw.Draw(img)
+    font = gc._load_first_available_font(gc.FONT_CANDIDATES_SEMIBOLD, 12)
+    _, h1 = gc._draw_pill(draw, 0, 0, "Current", font, min_width=70)
+    _, h2 = gc._draw_pill(draw, 0, 40, "Weekly", font, min_width=70)
+    assert h1 == h2
