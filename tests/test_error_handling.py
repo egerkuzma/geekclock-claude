@@ -1,13 +1,8 @@
-"""Тесты на широкий `except Exception` в fetch_claude_limits.
+"""Тесты на разделение «их» и «наших» ошибок в fetch_claude_limits.
 
-Он накрывает не только сетевой вызов, но и весь разбор ответа. Поэтому
-недоступность claude.ai и ошибка в нашем собственном коде выглядят
-одинаково: тихий фолбэк на кеш, одна строка в stderr, exit code 0.
-Первое — задуманное поведение, второе — нет.
-
-Два теста фиксируют то, что сейчас работает правильно. Третий помечен
-xfail(strict): он требует, чтобы баг в разборе не маскировался под аварию
-на той стороне.
+Недоступность claude.ai (сеть, 401/403/429/5xx, не-JSON тело) — тихий
+фолбэк на кеш. Ошибка в нашем собственном разборе — InternalError с
+фолбэком внутри: main() рисует что есть и выходит с ненулевым кодом.
 """
 
 import contextlib
@@ -80,7 +75,7 @@ def test_non_json_body_falls_back_to_cache(monkeypatch, stale_good_cache):
     assert json.loads(open(stale_good_cache).read())["five_hour_pct"] == 42
 
 
-# ====== то, что не работает ======
+# ====== наши ошибки ======
 
 def _break_our_parsing(monkeypatch):
     """Ответ от claude.ai корректный — ломается наш собственный разбор."""
@@ -122,13 +117,6 @@ def test_outage_without_cache_returns_none_quietly(monkeypatch, no_cache):
     assert gc.fetch_claude_limits("key", "org", no_cache, 300, 43200) is None
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "except Exception в fetch_claude_limits обёрнут вокруг всего блока, "
-    "включая разбор ответа. Ошибка в нашем коде (TypeError, KeyError, "
-    "опечатка в имени поля) неотличима от недоступности claude.ai: тихий "
-    "фолбэк, одна строка в stderr и exit code 0. Ронять часы не нужно — "
-    "нужно своё исключение с данными фолбэка внутри, чтобы main() "
-    "нарисовал что есть и вышел с ненулевым кодом."))
 def test_bug_in_our_own_code_raises_internal_error(
         monkeypatch, stale_good_cache):
     _break_our_parsing(monkeypatch)
@@ -139,10 +127,6 @@ def test_bug_in_our_own_code_raises_internal_error(
     assert ei.value.limits["five_hour_pct"] == 42
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "Признак в ключе словаря не переживает случай без кеша: функция "
-    "возвращает None, и ехать ему негде. /tmp чистится при перезагрузке, "
-    "так что первый утренний запуск — ровно этот случай."))
 def test_our_bug_without_cache_still_reports_itself(monkeypatch, no_cache):
     _break_our_parsing(monkeypatch)
     with pytest.raises(gc.InternalError) as ei:
@@ -153,22 +137,55 @@ def test_our_bug_without_cache_still_reports_itself(monkeypatch, no_cache):
 
 
 def test_our_bug_does_not_touch_the_cache(monkeypatch, stale_good_cache):
-    """Зелёный: разбор упал до _save_cache, так что кеш цел. Фиксируем,
-    чтобы фикс не начал писать в файл на пути обработки собственной ошибки.
-
-    suppress — потому что сейчас функция молча возвращает фолбэк, а после
-    фикса бросит InternalError; проверяем файл, а не способ выхода.
-    """
+    """Разбор упал до _save_cache, так что кеш цел. Фиксируем, чтобы
+    обработка собственной ошибки не начала писать в файл."""
     _break_our_parsing(monkeypatch)
     with contextlib.suppress(Exception):
         gc.fetch_claude_limits("key", "org", stale_good_cache, 300, 43200)
     assert json.loads(open(stale_good_cache).read())["five_hour_pct"] == 42
 
 
-# Следующим шагом, уже после фикса: main() ловит InternalError, рисует
-# e.limits (или NO DATA, если там None) и завершается ненулевым кодом.
-# Проверка на SystemExit.code — одна, тонкая, отдельным PR.
+# ====== main(): InternalError → рисуем фолбэк, выходим ненулевым кодом ======
 
-# Ключ в возвращаемом словаре на эту роль не годится: без кеша функция
-# возвращает None, и признаку негде ехать — а /tmp чистится при ребуте,
-# так что случай «кеша нет» наступает каждое утро.
+def _run_main(monkeypatch, tmp_path, limits_or_exc):
+    out_png = tmp_path / "out.png"
+    monkeypatch.setattr("sys.argv", [
+        "geekclock_claude", "--session-key", "k", "--org-id", "o",
+        "--dry-run", "--output", str(out_png),
+        "--cache-path", str(tmp_path / "cache.json"),
+    ])
+
+    def _fetch(*a, **kw):
+        if isinstance(limits_or_exc, Exception):
+            raise limits_or_exc
+        return limits_or_exc
+
+    monkeypatch.setattr(gc, "fetch_claude_limits", _fetch)
+    with pytest.raises(SystemExit) as ei:
+        gc.main()
+    return ei.value.code, out_png
+
+
+def test_main_exits_nonzero_on_internal_error_but_still_renders(
+        monkeypatch, tmp_path):
+    fallback = {"five_hour_pct": 42, "five_hour_resets_in_min": 60,
+                "seven_day_pct": 7, "seven_day_resets_in_min": 600}
+    code, out_png = _run_main(
+        monkeypatch, tmp_path,
+        gc.InternalError(TypeError("boom"), limits=fallback))
+    assert code == gc.EXIT_INTERNAL_ERROR
+    assert out_png.exists(), "картинка с фолбэком должна быть отрисована"
+
+
+def test_main_exits_nonzero_on_internal_error_without_fallback(
+        monkeypatch, tmp_path):
+    code, out_png = _run_main(
+        monkeypatch, tmp_path, gc.InternalError(TypeError("boom")))
+    assert code == gc.EXIT_INTERNAL_ERROR
+    assert out_png.exists(), "NO DATA тоже должен быть отрисован"
+
+
+def test_main_exits_zero_on_outage_fallback(monkeypatch, tmp_path):
+    """Авария на той стороне — не наша ошибка, код выхода нулевой."""
+    code, _ = _run_main(monkeypatch, tmp_path, None)
+    assert code == 0
