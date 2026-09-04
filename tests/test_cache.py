@@ -1,8 +1,8 @@
-"""Тесты на разбор времени сброса и на кеш.
+"""Tests for reset-time parsing and the cache.
 
-Кеш поблочный: у five_hour и seven_day свои метки fetched_at. Пустой или
-частичный ответ с HTTP 200 не затирает старые блоки, а протухание
-считается по метке блока, а не по mtime файла.
+The cache is per-block: five_hour and seven_day carry their own fetched_at
+stamps. An empty or partial HTTP 200 body does not wipe the old blocks, and
+staleness is judged by the block's own stamp, not by the file mtime.
 """
 
 import json
@@ -32,18 +32,18 @@ def test_parse_accepts_z_suffix():
 
 
 def test_parse_past_timestamp_is_clamped_to_zero():
-    # Сброс уже прошёл — наружу не должно уйти отрицательное число.
+    # The reset is already in the past — a negative number must not leak out.
     assert gc._parse_resets_at("2020-01-01T00:00:00Z") == 0
 
 
 def test_parse_garbage_returns_none():
-    assert gc._parse_resets_at("не дата") is None
+    assert gc._parse_resets_at("not a date") is None
     assert gc._parse_resets_at("") is None
     assert gc._parse_resets_at(None) is None
 
 
 def test_parse_naive_timestamp_returns_none():
-    # Без таймзоны вычитание aware-даты бросает TypeError; ловится в except.
+    # Without a timezone, subtracting an aware datetime raises TypeError; caught by the except.
     assert gc._parse_resets_at("2030-01-01T00:00:00") is None
 
 
@@ -87,20 +87,24 @@ def test_build_result_from_valid_payload():
     assert gc._build_result_from_api_data(data) == {
         "five_hour_pct": 42, "five_hour_resets_at": resets,
         "seven_day_pct": 7, "seven_day_resets_at": resets,
+        "model_weekly_pct": None, "model_weekly_resets_at": None,
+        "model_weekly_label": None,
     }
 
 
 def test_build_result_from_empty_payload_is_all_none():
-    # Пустой/изменившийся ответ превращается в словарь из None;
-    # fetch_claude_limits трактует None-блок как «не пришёл» и оставляет
-    # в кеше прежнее значение этого блока.
+    # An empty/changed response turns into a dict of Nones;
+    # fetch_claude_limits treats a None block as "not reported" and keeps
+    # the previous cached value of that block.
     assert gc._build_result_from_api_data({}) == {
         "five_hour_pct": None, "five_hour_resets_at": None,
         "seven_day_pct": None, "seven_day_resets_at": None,
+        "model_weekly_pct": None, "model_weekly_resets_at": None,
+        "model_weekly_label": None,
     }
 
 
-# ====== fetch_claude_limits: отравление кеша ======
+# ====== fetch_claude_limits: cache poisoning ======
 
 class _FakeResponse:
     def __init__(self, status_code, payload):
@@ -114,23 +118,23 @@ class _FakeResponse:
 
 @pytest.fixture
 def stale_good_cache(tmp_path):
-    """Живой кеш с настоящими данными, но старше TTL — значит, будет запрос."""
+    """A healthy cache with real data, but older than TTL — so a request will be made."""
     path = tmp_path / "cache.json"
     path.write_text(json.dumps({
         "five_hour_pct": 42, "five_hour_resets_at": _iso_in(60),
         "seven_day_pct": 7, "seven_day_resets_at": _iso_in(600),
     }))
-    old = time.time() - 600  # TTL по умолчанию 300 с
+    old = time.time() - 600  # default TTL is 300 s
     os.utime(path, (old, old))
     return str(path)
 
 
 def _patch_response(monkeypatch, response):
-    """Подменяет сетевой вызов и возвращает счётчик обращений.
+    """Stub the network call and return a call counter.
 
-    Считаем снаружи, а не бросаем исключение внутри: fetch_claude_limits
-    обёрнут в except Exception и проглотил бы даже AssertionError, молча
-    уйдя в фолбэк, — проверка получилась бы декоративной.
+    We count from the outside instead of raising inside: fetch_claude_limits
+    is wrapped in except Exception and would swallow even an AssertionError,
+    silently falling back — the check would be decorative.
     """
     calls = []
 
@@ -178,10 +182,10 @@ def test_next_run_after_empty_body_still_shows_data(
     gc.fetch_claude_limits("key", "org", stale_good_cache, 300, 43200)
     assert len(calls) == 1
 
-    # Следующий запуск через минуту: кеш только что переписан, значит свежий,
-    # и в сеть мы уже не идём — на экран уходит то, что лежит в файле.
+    # Next run a minute later: the cache was just rewritten, so it is fresh,
+    # no network call — whatever is in the file goes to the screen.
     out = gc.fetch_claude_limits("key", "org", stale_good_cache, 300, 43200)
-    assert len(calls) == 1, "второго запроса быть не должно: кеш свежий"
+    assert len(calls) == 1, "no second request expected: cache is fresh"
     assert out["five_hour_pct"] == 42
 
 
@@ -192,15 +196,15 @@ def test_partial_payload_must_not_wipe_the_other_block(
     }))
     gc.fetch_claude_limits("key", "org", stale_good_cache, 300, 43200)
     cache = json.loads(open(stale_good_cache).read())
-    assert cache["five_hour_pct"] == 55      # свежий блок обновился
-    assert cache["seven_day_pct"] == 7       # старый блок уцелел
+    assert cache["five_hour_pct"] == 55      # fresh block updated
+    assert cache["seven_day_pct"] == 7       # old block survived
 
 
 @pytest.fixture
 def cache_with_old_seven_day(tmp_path):
-    """Кеш, где недельный блок не обновлялся 13 часов, а пятичасовой свежий.
+    """A cache whose weekly block is 13 hours old while the 5-hour one is fresh.
 
-    Метки времени поблочные: один mtime на файл не отличает эти два случая.
+    Timestamps are per-block: a single file mtime cannot tell these apart.
     """
     path = tmp_path / "cache.json"
     now = time.time()
@@ -222,9 +226,9 @@ def test_merged_block_expires_by_its_own_timestamp(
     out = gc.fetch_claude_limits(
         "key", "org", cache_with_old_seven_day, 300, 43200)
     assert out["five_hour_pct"] == 55
-    # Неделя не приходит 13 часов — честнее прочерк, чем бодрые 7%.
+    # The weekly block has not arrived for 13 hours — a dash is more honest than a cheerful 7%.
     assert out["seven_day_pct"] is None
 
-    # И метка недельного блока не должна помолодеть от чужого успеха.
+    # And the weekly block's stamp must not get younger from another block's success.
     cache = json.loads(open(cache_with_old_seven_day).read())
     assert time.time() - cache["seven_day_fetched_at"] > 12 * 3600
