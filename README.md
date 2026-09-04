@@ -34,9 +34,11 @@ Every time it runs (typically once a minute via cron):
 
 1. Calls `claude.ai/api/organizations/{org}/usage` — the same endpoint
    the Claude.ai website uses on the **Settings → Usage** page
-2. Renders a 240×240 PNG with two progress bars:
+2. Renders a 240×240 image with a progress bar per limit:
    - **Current** — 5-hour rolling window
-   - **Weekly** — 7-day rolling window
+   - **Weekly** — 7-day rolling window, all models
+   - **Fable** (or whatever model the API reports) — the per-model
+     7-day window, shown only when your plan has one
 3. Uploads the image to your clock over HTTP
 
 Bars are colour-coded:
@@ -44,7 +46,11 @@ Bars are colour-coded:
 - 🟡 **yellow** 50–80%
 - 🔴 **red** above 80%
 
-Both blocks also show time until reset ("Resets in 4h 37m", "Resets in 3d").
+The blocks also show time until reset ("Resets in 4h 37m", "Resets in 2d 1h").
+The weekly limits all reset at the same moment, so that line is drawn once,
+under the last weekly bar.
+
+![Rendered image](docs/preview.png)
 
 ## Why this approach?
 
@@ -166,8 +172,8 @@ a minute-by-minute cron only one in five runs actually hits the API.
 The countdown texts ("Resets in 4h 37m") are recalculated from cached
 data on every run, so they tick down accurately.
 
-The cache is kept per block: the 5-hour and weekly values each carry
-their own timestamp. If the API answers with an empty or partial body,
+The cache is kept per block: the 5-hour, weekly and per-model values
+each carry their own timestamp. If the API answers with an empty or partial body,
 the missing block keeps its last known value instead of being wiped.
 A block older than 12 hours is hidden (shown as "—") rather than
 displayed as if it were current.
