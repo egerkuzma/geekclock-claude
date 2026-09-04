@@ -3,8 +3,9 @@
 geekclock-claude — push Claude.ai usage limits to a GeekMagic SmallTV clock.
 
 On each run it fetches usage data from claude.ai/api/.../usage via curl_cffi
-(Chrome TLS impersonation to bypass Cloudflare), renders a 240x240 image
-and uploads it to the device.
+(Safari TLS impersonation to bypass Cloudflare), renders a 240x240 image
+with the 5-hour, weekly and (when reported) per-model weekly limits, and
+uploads it to the device.
 
 Configuration is read from environment variables (see .env.example) or
 command-line arguments.
@@ -106,13 +107,20 @@ def _format_reset_long(minutes):
 # Cache file layout (per-block timestamps):
 #   {
 #     "five_hour_pct": 42, "five_hour_resets_at": "...", "five_hour_fetched_at": 1.7e9,
-#     "seven_day_pct": 7,  "seven_day_resets_at": "...", "seven_day_fetched_at": 1.7e9
+#     "seven_day_pct": 7,  "seven_day_resets_at": "...", "seven_day_fetched_at": 1.7e9,
+#     "model_weekly_pct": 32, "model_weekly_resets_at": "...",
+#     "model_weekly_fetched_at": 1.7e9, "model_weekly_label": "Fable"
 #   }
 # A block missing from an API response keeps its previous value and its
 # own fetched_at, so a partial or empty payload never wipes good data.
 # Blocks older than max_fallback are hidden on read, independently.
+#
+# "model_weekly" is the per-model weekly limit (e.g. Fable). It is not a
+# top-level key in the API response; it lives in the "limits" array as an
+# entry with kind="weekly_scoped" and scope.model.display_name.
 
-BLOCKS = ("five_hour", "seven_day")
+BLOCKS = ("five_hour", "seven_day", "model_weekly")
+BLOCK_EXTRA_FIELDS = ("label",)   # optional per-block fields carried through the cache
 
 
 class InternalError(Exception):
@@ -127,6 +135,37 @@ class InternalError(Exception):
         self.limits = limits
 
 
+def _as_pct(value):
+    """Return value if it's a real number (not bool), else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+def _find_model_weekly_limit(limits):
+    """Pick the per-model weekly limit out of the "limits" array.
+
+    Looks for the first entry with kind="weekly_scoped" whose scope names a
+    model (scope.model.display_name), e.g. the Fable weekly quota.
+    Returns {"pct", "resets_at", "label"} or None."""
+    if not isinstance(limits, list):
+        return None
+    for item in limits:
+        if not isinstance(item, dict) or item.get("kind") != "weekly_scoped":
+            continue
+        scope = item.get("scope")
+        model = scope.get("model") if isinstance(scope, dict) else None
+        label = model.get("display_name") if isinstance(model, dict) else None
+        if not label:
+            continue
+        return {
+            "pct": _as_pct(item.get("percent")),
+            "resets_at": item.get("resets_at"),
+            "label": str(label),
+        }
+    return None
+
+
 def _build_result_from_api_data(data):
     """Extract the fields we care about from the API response.
     We store ISO timestamps verbatim; reset-minutes are recomputed on read
@@ -134,15 +173,17 @@ def _build_result_from_api_data(data):
     if not isinstance(data, dict):
         data = {}
     result = {}
-    for block in BLOCKS:
+    for block in ("five_hour", "seven_day"):
         entry = data.get(block) or {}
         if not isinstance(entry, dict):
             entry = {}
-        pct = entry.get("utilization")
-        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
-            pct = None
-        result[f"{block}_pct"] = pct
+        result[f"{block}_pct"] = _as_pct(entry.get("utilization"))
         result[f"{block}_resets_at"] = entry.get("resets_at")
+
+    scoped = _find_model_weekly_limit(data.get("limits")) or {}
+    result["model_weekly_pct"] = scoped.get("pct")
+    result["model_weekly_resets_at"] = scoped.get("resets_at")
+    result["model_weekly_label"] = scoped.get("label")
     return result
 
 
@@ -157,17 +198,21 @@ def _merge_cache(cached, age, fresh, now=None):
     merged = {}
     for block in BLOCKS:
         if fresh.get(f"{block}_pct") is not None:
-            merged[f"{block}_pct"] = fresh[f"{block}_pct"]
-            merged[f"{block}_resets_at"] = fresh.get(f"{block}_resets_at")
+            src = fresh
             merged[f"{block}_fetched_at"] = now
         elif cached.get(f"{block}_pct") is not None:
-            merged[f"{block}_pct"] = cached[f"{block}_pct"]
-            merged[f"{block}_resets_at"] = cached.get(f"{block}_resets_at")
+            src = cached
             merged[f"{block}_fetched_at"] = cached.get(
                 f"{block}_fetched_at", legacy_stamp)
         else:
             merged[f"{block}_pct"] = None
             merged[f"{block}_resets_at"] = None
+            continue
+        merged[f"{block}_pct"] = src[f"{block}_pct"]
+        merged[f"{block}_resets_at"] = src.get(f"{block}_resets_at")
+        for extra in BLOCK_EXTRA_FIELDS:
+            if src.get(f"{block}_{extra}") is not None:
+                merged[f"{block}_{extra}"] = src[f"{block}_{extra}"]
     return merged
 
 
@@ -225,6 +270,9 @@ def _fallback_cache(cached, age, max_age, now=None):
         out[f"{block}_pct"] = pct
         out[f"{block}_resets_at"] = resets_at
         out[f"{block}_resets_in_min"] = _parse_resets_at(resets_at)
+        for extra in BLOCK_EXTRA_FIELDS:
+            if cached.get(f"{block}_{extra}") is not None:
+                out[f"{block}_{extra}"] = cached[f"{block}_{extra}"]
     return out if any_data else None
 
 
@@ -385,15 +433,38 @@ def _draw_pill(draw, x, y, text, font, padding_x=10, padding_y=5, min_width=0):
     return w, h
 
 
+# Two layout presets: the roomy one for two blocks (5h + weekly) and a
+# compact one that fits a third per-model block (e.g. Fable) on 240x240.
+# Each preset: (first block y, block pitch, pct font, pill font, meta font,
+#               pill y offset, bar y offset, bar height, reset text y offset)
+LAYOUT_ROOMY = dict(top=42, pitch=93, f_pct=44, f_pill=13, f_meta=15,
+                    pill_dy=12, bar_dy=48, bar_h=16, reset_dy=68)
+LAYOUT_COMPACT = dict(top=42, pitch=66, f_pct=30, f_pill=12, f_meta=12,
+                      pill_dy=2, bar_dy=30, bar_h=12, reset_dy=46)
+
+
+def _blocks_to_draw(limits):
+    """[(title, pct, resets_in_min), ...] in display order. The per-model
+    weekly block is only included when the API actually reported one."""
+    blocks = [
+        ("Current", limits.get("five_hour_pct"),
+         limits.get("five_hour_resets_in_min")),
+        ("Weekly", limits.get("seven_day_pct"),
+         limits.get("seven_day_resets_in_min")),
+    ]
+    if limits.get("model_weekly_pct") is not None:
+        blocks.append((limits.get("model_weekly_label") or "Model",
+                       limits.get("model_weekly_pct"),
+                       limits.get("model_weekly_resets_in_min")))
+    return blocks
+
+
 def create_image(limits):
     W, H = 240, 240
     img = Image.new("RGB", (W, H), color=COL_BG)
     draw = ImageDraw.Draw(img)
 
     f_title = _load_first_available_font(FONT_CANDIDATES_TITLE, 32)
-    f_pct = _load_first_available_font(FONT_CANDIDATES_BOLD, 44)
-    f_meta = _load_first_available_font(FONT_CANDIDATES_SEMIBOLD, 15)
-    f_pill = _load_first_available_font(FONT_CANDIDATES_SEMIBOLD, 13)
     f_tiny = _load_first_available_font(FONT_CANDIDATES_REGULAR, 12)
 
     # Header: mascot on the left, "Usage" centered, time on the right.
@@ -412,37 +483,30 @@ def create_image(limits):
         draw.text((10, 110), "NO DATA", fill=COL_BAR_RED, font=f_title)
         return img
 
-    # Compute a shared width for both pills so Current/Weekly match.
+    blocks = _blocks_to_draw(limits)
+    L = LAYOUT_COMPACT if len(blocks) > 2 else LAYOUT_ROOMY
+    f_pct = _load_first_available_font(FONT_CANDIDATES_BOLD, L["f_pct"])
+    f_meta = _load_first_available_font(FONT_CANDIDATES_SEMIBOLD, L["f_meta"])
+    f_pill = _load_first_available_font(FONT_CANDIDATES_SEMIBOLD, L["f_pill"])
+
+    # Shared pill width so all labels (Current/Weekly/Fable) match.
     pill_min_width = 0
-    for txt in ("Current", "Weekly"):
-        bb = draw.textbbox((0, 0), txt, font=f_pill)
+    for title, _, _ in blocks:
+        bb = draw.textbbox((0, 0), title, font=f_pill)
         pill_min_width = max(pill_min_width, (bb[2] - bb[0]) + 20)
 
-    # Block 1: Current (5-hour rolling window)
-    block_y = 42
-    fh_pct = limits.get("five_hour_pct")
-    pct_text = f"{int(fh_pct)}%" if fh_pct is not None else "—"
-    draw.text((10, block_y), pct_text, fill=COL_TEXT, font=f_pct)
-    _draw_pill(draw, W - pill_min_width - 10, block_y + 12,
-               "Current", f_pill, min_width=pill_min_width)
-    _draw_rounded_bar(draw, 10, block_y + 48, W - 20, 16,
-                      fh_pct, _color_for_pct(fh_pct))
-    fh_reset = _format_reset_long(limits.get("five_hour_resets_in_min"))
-    if fh_reset:
-        draw.text((10, block_y + 68), fh_reset, fill=COL_TEXT, font=f_meta)
-
-    # Block 2: Weekly (7-day rolling window)
-    block_y = 135
-    sd_pct = limits.get("seven_day_pct")
-    pct_text = f"{int(sd_pct)}%" if sd_pct is not None else "—"
-    draw.text((10, block_y), pct_text, fill=COL_TEXT, font=f_pct)
-    _draw_pill(draw, W - pill_min_width - 10, block_y + 12,
-               "Weekly", f_pill, min_width=pill_min_width)
-    _draw_rounded_bar(draw, 10, block_y + 48, W - 20, 16,
-                      sd_pct, _color_for_pct(sd_pct))
-    sd_reset = _format_reset_long(limits.get("seven_day_resets_in_min"))
-    if sd_reset:
-        draw.text((10, block_y + 68), sd_reset, fill=COL_TEXT, font=f_meta)
+    for i, (title, pct, reset_min) in enumerate(blocks):
+        y = L["top"] + i * L["pitch"]
+        pct_text = f"{int(pct)}%" if pct is not None else "—"
+        draw.text((10, y), pct_text, fill=COL_TEXT, font=f_pct)
+        _draw_pill(draw, W - pill_min_width - 10, y + L["pill_dy"],
+                   title, f_pill, min_width=pill_min_width)
+        _draw_rounded_bar(draw, 10, y + L["bar_dy"], W - 20, L["bar_h"],
+                          pct, _color_for_pct(pct))
+        reset = _format_reset_long(reset_min)
+        if reset:
+            draw.text((10, y + L["reset_dy"]), reset,
+                      fill=COL_TEXT, font=f_meta)
 
     return img
 
@@ -570,6 +634,9 @@ def main():
         if limits:
             cl_str = (f"5h={limits.get('five_hour_pct')}% "
                       f"7d={limits.get('seven_day_pct')}%")
+            if limits.get("model_weekly_pct") is not None:
+                cl_str += (f" {limits.get('model_weekly_label') or 'model'}="
+                           f"{limits.get('model_weekly_pct')}%")
         else:
             cl_str = "no data"
         print(f"[{datetime.now():%H:%M:%S}] {cl_str}, uploaded={ok}")

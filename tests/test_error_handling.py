@@ -1,8 +1,9 @@
-"""Тесты на разделение «их» и «наших» ошибок в fetch_claude_limits.
+"""Tests separating "their" errors from "ours" in fetch_claude_limits.
 
-Недоступность claude.ai (сеть, 401/403/429/5xx, не-JSON тело) — тихий
-фолбэк на кеш. Ошибка в нашем собственном разборе — InternalError с
-фолбэком внутри: main() рисует что есть и выходит с ненулевым кодом.
+claude.ai being unreachable (network, 401/403/429/5xx, non-JSON body) is a
+quiet fallback to the cache. A failure in our own parsing is an
+InternalError carrying the fallback: main() renders what it can and exits
+non-zero.
 """
 
 import contextlib
@@ -22,20 +23,20 @@ def _iso_in(minutes):
 
 @pytest.fixture
 def stale_good_cache(tmp_path):
-    """Кеш с настоящими данными, но старше TTL — значит, будет запрос."""
+    """A cache with real data, but older than TTL — so a request will be made."""
     path = tmp_path / "cache.json"
     path.write_text(json.dumps({
         "five_hour_pct": 42, "five_hour_resets_at": _iso_in(60),
         "seven_day_pct": 7, "seven_day_resets_at": _iso_in(600),
     }))
-    old = time.time() - 600  # TTL по умолчанию 300 с
+    old = time.time() - 600  # default TTL is 300 s
     os.utime(path, (old, old))
     return str(path)
 
 
 @pytest.fixture
 def no_cache(tmp_path):
-    """Кеша нет — например, первый запуск после ребута: /tmp вычищен."""
+    """No cache — e.g. the first run after a reboot: /tmp was wiped."""
     return str(tmp_path / "cache.json")
 
 
@@ -51,10 +52,10 @@ class _FakeResponse:
         return self._payload
 
 
-# ====== то, что сейчас работает правильно ======
+# ====== their side: quiet fallback ======
 
 def test_network_error_falls_back_to_cache(monkeypatch, stale_good_cache):
-    """claude.ai недоступен — показываем последние известные цифры."""
+    """claude.ai is unreachable — show the last known numbers."""
     def _no_network(*a, **kw):
         raise ConnectionError("Failed to connect to claude.ai")
 
@@ -65,8 +66,8 @@ def test_network_error_falls_back_to_cache(monkeypatch, stale_good_cache):
 
 
 def test_non_json_body_falls_back_to_cache(monkeypatch, stale_good_cache):
-    """HTTP 200 с HTML-страницей Cloudflare вместо JSON — тоже их проблема,
-    фолбэк уместен, и кеш при этом трогать нельзя."""
+    """HTTP 200 with a Cloudflare HTML page instead of JSON is their problem
+    too: fallback is appropriate, and the cache must not be touched."""
     monkeypatch.setattr(gc.cffi_requests, "get",
                         lambda *a, **kw: _FakeResponse(200, None,
                                                        "<html>challenge</html>"))
@@ -75,10 +76,10 @@ def test_non_json_body_falls_back_to_cache(monkeypatch, stale_good_cache):
     assert json.loads(open(stale_good_cache).read())["five_hour_pct"] == 42
 
 
-# ====== наши ошибки ======
+# ====== our side: InternalError ======
 
 def _break_our_parsing(monkeypatch):
-    """Ответ от claude.ai корректный — ломается наш собственный разбор."""
+    """The claude.ai response is fine — our own parsing breaks."""
     monkeypatch.setattr(gc.cffi_requests, "get",
                         lambda *a, **kw: _FakeResponse(200, {
                             "five_hour": {"utilization": 55,
@@ -94,10 +95,9 @@ def _break_our_parsing(monkeypatch):
 
 
 def test_outage_is_not_flagged_as_our_fault(monkeypatch, stale_good_cache):
-    """Вторая половина инварианта: авария на той стороне — штатный фолбэк.
-
-    Зелёный сейчас и обязан остаться зелёным после фикса: чинить надо так,
-    чтобы недоступность claude.ai по-прежнему уходила в тихий фолбэк.
+    """The other half of the invariant: an outage on their side is a normal
+    fallback. claude.ai being unreachable must keep going to the quiet
+    fallback path.
     """
     def _no_network(*a, **kw):
         raise ConnectionError("Failed to connect to claude.ai")
@@ -108,8 +108,8 @@ def test_outage_is_not_flagged_as_our_fault(monkeypatch, stale_good_cache):
 
 
 def test_outage_without_cache_returns_none_quietly(monkeypatch, no_cache):
-    """Та же вторая половина, но после ребута: кеша нет, показываем NO DATA
-    и выходим тихо. Это не наша ошибка, ронять и сигналить нечего."""
+    """Same, but after a reboot: no cache, we show NO DATA and exit quietly.
+    Not our fault, nothing to crash on or signal."""
     def _no_network(*a, **kw):
         raise ConnectionError("Failed to connect to claude.ai")
 
@@ -123,7 +123,7 @@ def test_bug_in_our_own_code_raises_internal_error(
     with pytest.raises(gc.InternalError) as ei:
         gc.fetch_claude_limits("key", "org", stale_good_cache, 300, 43200)
 
-    # Фолбэк не потерян: он едет в исключении, а не в возвращаемом значении.
+    # The fallback is not lost: it travels in the exception, not the return value.
     assert ei.value.limits["five_hour_pct"] == 42
 
 
@@ -132,20 +132,20 @@ def test_our_bug_without_cache_still_reports_itself(monkeypatch, no_cache):
     with pytest.raises(gc.InternalError) as ei:
         gc.fetch_claude_limits("key", "org", no_cache, 300, 43200)
 
-    # Рисовать нечего — NO DATA, — но причина названа: сломались мы.
+    # Nothing to draw — NO DATA — but the cause is named: we broke.
     assert ei.value.limits is None
 
 
 def test_our_bug_does_not_touch_the_cache(monkeypatch, stale_good_cache):
-    """Разбор упал до _save_cache, так что кеш цел. Фиксируем, чтобы
-    обработка собственной ошибки не начала писать в файл."""
+    """Parsing failed before _save_cache, so the cache is intact. Pinned so
+    that handling our own error never starts writing the file."""
     _break_our_parsing(monkeypatch)
     with contextlib.suppress(Exception):
         gc.fetch_claude_limits("key", "org", stale_good_cache, 300, 43200)
     assert json.loads(open(stale_good_cache).read())["five_hour_pct"] == 42
 
 
-# ====== main(): InternalError → рисуем фолбэк, выходим ненулевым кодом ======
+# ====== main(): InternalError -> render the fallback, exit non-zero ======
 
 def _run_main(monkeypatch, tmp_path, limits_or_exc):
     out_png = tmp_path / "out.png"
@@ -174,7 +174,7 @@ def test_main_exits_nonzero_on_internal_error_but_still_renders(
         monkeypatch, tmp_path,
         gc.InternalError(TypeError("boom"), limits=fallback))
     assert code == gc.EXIT_INTERNAL_ERROR
-    assert out_png.exists(), "картинка с фолбэком должна быть отрисована"
+    assert out_png.exists(), "the fallback image must be rendered"
 
 
 def test_main_exits_nonzero_on_internal_error_without_fallback(
@@ -182,10 +182,10 @@ def test_main_exits_nonzero_on_internal_error_without_fallback(
     code, out_png = _run_main(
         monkeypatch, tmp_path, gc.InternalError(TypeError("boom")))
     assert code == gc.EXIT_INTERNAL_ERROR
-    assert out_png.exists(), "NO DATA тоже должен быть отрисован"
+    assert out_png.exists(), "NO DATA must be rendered as well"
 
 
 def test_main_exits_zero_on_outage_fallback(monkeypatch, tmp_path):
-    """Авария на той стороне — не наша ошибка, код выхода нулевой."""
+    """An outage on their side is not our fault: exit code is zero."""
     code, _ = _run_main(monkeypatch, tmp_path, None)
     assert code == 0

@@ -1,4 +1,4 @@
-# секреты — никогда не коммитим
+# secrets — never commit
 .env
 .claude_session_key
 *.session_key
@@ -26,7 +26,7 @@ build/
 .DS_Store
 Thumbs.db
 
-# тестовые превью и логи
+# test previews and logs
 preview.png
 *.log
 /tmp/geekclock_claude_cache.json
