@@ -3,8 +3,9 @@
 geekclock-claude — push Claude.ai usage limits to a GeekMagic SmallTV clock.
 
 On each run it fetches usage data from claude.ai/api/.../usage via curl_cffi
-(Chrome TLS impersonation to bypass Cloudflare), renders a 240x240 image
-and uploads it to the device.
+(Safari TLS impersonation to bypass Cloudflare), renders a 240x240 image
+with the 5-hour, weekly and (when reported) per-model weekly limits, and
+uploads it to the device.
 
 Configuration is read from environment variables (see .env.example) or
 command-line arguments.
@@ -50,6 +51,13 @@ COL_PILL_TEXT = (245, 245, 245)
 
 # --- font candidates (tried in order, first existing one is used) ---
 FONT_CANDIDATES_BOLD = [
+    "/usr/share/fonts/opentype/inter/Inter-Bold.otf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/Library/Fonts/Helvetica.ttc",
+]
+FONT_CANDIDATES_PCT = [          # the big percent numbers: heaviest weight available
+    "/usr/share/fonts/opentype/inter/Inter-Black.otf",
+    "/usr/share/fonts/opentype/inter/Inter-ExtraBold.otf",
     "/usr/share/fonts/opentype/inter/Inter-Bold.otf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/Library/Fonts/Helvetica.ttc",
@@ -106,13 +114,20 @@ def _format_reset_long(minutes):
 # Cache file layout (per-block timestamps):
 #   {
 #     "five_hour_pct": 42, "five_hour_resets_at": "...", "five_hour_fetched_at": 1.7e9,
-#     "seven_day_pct": 7,  "seven_day_resets_at": "...", "seven_day_fetched_at": 1.7e9
+#     "seven_day_pct": 7,  "seven_day_resets_at": "...", "seven_day_fetched_at": 1.7e9,
+#     "model_weekly_pct": 32, "model_weekly_resets_at": "...",
+#     "model_weekly_fetched_at": 1.7e9, "model_weekly_label": "Fable"
 #   }
 # A block missing from an API response keeps its previous value and its
 # own fetched_at, so a partial or empty payload never wipes good data.
 # Blocks older than max_fallback are hidden on read, independently.
+#
+# "model_weekly" is the per-model weekly limit (e.g. Fable). It is not a
+# top-level key in the API response; it lives in the "limits" array as an
+# entry with kind="weekly_scoped" and scope.model.display_name.
 
-BLOCKS = ("five_hour", "seven_day")
+BLOCKS = ("five_hour", "seven_day", "model_weekly")
+BLOCK_EXTRA_FIELDS = ("label",)   # optional per-block fields carried through the cache
 
 
 class InternalError(Exception):
@@ -127,6 +142,37 @@ class InternalError(Exception):
         self.limits = limits
 
 
+def _as_pct(value):
+    """Return value if it's a real number (not bool), else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+def _find_model_weekly_limit(limits):
+    """Pick the per-model weekly limit out of the "limits" array.
+
+    Looks for the first entry with kind="weekly_scoped" whose scope names a
+    model (scope.model.display_name), e.g. the Fable weekly quota.
+    Returns {"pct", "resets_at", "label"} or None."""
+    if not isinstance(limits, list):
+        return None
+    for item in limits:
+        if not isinstance(item, dict) or item.get("kind") != "weekly_scoped":
+            continue
+        scope = item.get("scope")
+        model = scope.get("model") if isinstance(scope, dict) else None
+        label = model.get("display_name") if isinstance(model, dict) else None
+        if not label:
+            continue
+        return {
+            "pct": _as_pct(item.get("percent")),
+            "resets_at": item.get("resets_at"),
+            "label": str(label),
+        }
+    return None
+
+
 def _build_result_from_api_data(data):
     """Extract the fields we care about from the API response.
     We store ISO timestamps verbatim; reset-minutes are recomputed on read
@@ -134,15 +180,17 @@ def _build_result_from_api_data(data):
     if not isinstance(data, dict):
         data = {}
     result = {}
-    for block in BLOCKS:
+    for block in ("five_hour", "seven_day"):
         entry = data.get(block) or {}
         if not isinstance(entry, dict):
             entry = {}
-        pct = entry.get("utilization")
-        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
-            pct = None
-        result[f"{block}_pct"] = pct
+        result[f"{block}_pct"] = _as_pct(entry.get("utilization"))
         result[f"{block}_resets_at"] = entry.get("resets_at")
+
+    scoped = _find_model_weekly_limit(data.get("limits")) or {}
+    result["model_weekly_pct"] = scoped.get("pct")
+    result["model_weekly_resets_at"] = scoped.get("resets_at")
+    result["model_weekly_label"] = scoped.get("label")
     return result
 
 
@@ -157,17 +205,21 @@ def _merge_cache(cached, age, fresh, now=None):
     merged = {}
     for block in BLOCKS:
         if fresh.get(f"{block}_pct") is not None:
-            merged[f"{block}_pct"] = fresh[f"{block}_pct"]
-            merged[f"{block}_resets_at"] = fresh.get(f"{block}_resets_at")
+            src = fresh
             merged[f"{block}_fetched_at"] = now
         elif cached.get(f"{block}_pct") is not None:
-            merged[f"{block}_pct"] = cached[f"{block}_pct"]
-            merged[f"{block}_resets_at"] = cached.get(f"{block}_resets_at")
+            src = cached
             merged[f"{block}_fetched_at"] = cached.get(
                 f"{block}_fetched_at", legacy_stamp)
         else:
             merged[f"{block}_pct"] = None
             merged[f"{block}_resets_at"] = None
+            continue
+        merged[f"{block}_pct"] = src[f"{block}_pct"]
+        merged[f"{block}_resets_at"] = src.get(f"{block}_resets_at")
+        for extra in BLOCK_EXTRA_FIELDS:
+            if src.get(f"{block}_{extra}") is not None:
+                merged[f"{block}_{extra}"] = src[f"{block}_{extra}"]
     return merged
 
 
@@ -225,6 +277,9 @@ def _fallback_cache(cached, age, max_age, now=None):
         out[f"{block}_pct"] = pct
         out[f"{block}_resets_at"] = resets_at
         out[f"{block}_resets_in_min"] = _parse_resets_at(resets_at)
+        for extra in BLOCK_EXTRA_FIELDS:
+            if cached.get(f"{block}_{extra}") is not None:
+                out[f"{block}_{extra}"] = cached[f"{block}_{extra}"]
     return out if any_data else None
 
 
@@ -369,20 +424,104 @@ def _draw_rounded_bar(draw, x, y, w, h, pct, color):
 
 def _draw_pill(draw, x, y, text, font, padding_x=10, padding_y=5, min_width=0):
     """Rounded rectangle with centered text inside.
-    min_width lets multiple pills (Current/Weekly) match in size."""
-    bbox = draw.textbbox((0, 0), text, font=font)
-    tw = bbox[2] - bbox[0]
-    th = bbox[3] - bbox[1]
-    text_top_offset = bbox[1]
+
+    Height is derived from the font's cap height (not from the word's own
+    ink box), so a word with a descender ("Weekly") gets the same pill as
+    one without ("Current") and its letters sit visually centred.
+    min_width lets multiple pills match in size."""
+    cap = draw.textbbox((0, 0), "H", font=font, anchor="ls")
+    cap_h = cap[3] - cap[1]            # baseline-relative: bbox[1] is negative
+    ink = draw.textbbox((0, 0), text, font=font, anchor="ls")
+    tw = ink[2] - ink[0]
 
     w = max(tw + padding_x * 2, min_width)
-    h = th + padding_y * 2
+    h = cap_h + padding_y * 2
     radius = h // 2
     draw.rounded_rectangle([x, y, x + w, y + h], radius=radius, fill=COL_PILL_BG)
-    text_x = x + (w - tw) // 2 - bbox[0]
-    text_y = y + (h - th) // 2 - text_top_offset
-    draw.text((text_x, text_y), text, fill=COL_PILL_TEXT, font=font)
+    text_x = x + (w - tw) // 2 - ink[0]
+    baseline = y + padding_y + cap_h
+    draw.text((text_x, baseline), text, fill=COL_PILL_TEXT, font=font, anchor="ls")
     return w, h
+
+
+# Layout presets. Blocks are flowed top-to-bottom; whatever vertical space
+# is left after all blocks is spread evenly between them, so the screen is
+# filled edge to edge regardless of how many blocks / reset lines there are.
+#   f_pct/f_pill/f_meta: font sizes; pill_dy: pill offset from block top;
+#   pct_to_bar: gap between the percent text and the bar; bar_h: bar height;
+#   bar_to_reset: gap between the bar and the "Resets in" line.
+LAYOUT_ROOMY = dict(f_pct=44, f_pill=13, f_meta=15, pill_dy=12,
+                    pct_to_bar=12, bar_h=16, bar_to_reset=6)
+LAYOUT_COMPACT = dict(f_pct=26, f_pill=12, f_meta=12, pill_dy=2,
+                      pct_to_bar=10, bar_h=12, bar_to_reset=5)
+BLOCKS_TOP = 40          # first block y (below the header)
+BLOCKS_BOTTOM = 226      # last block must end above this line; the SmallTV
+                         # panel clips the bottom ~10 px of the 240 px image
+SIDE = 10                # left/right margin
+PCT_SIGN_GAP = 4         # ink gap between the digits and the "%" sign, px
+HEADER_CY = 18           # vertical centre of the header row (mascot centre)
+MASCOT_X = 12            # mascot left edge (its arms); body starts 4 px further right
+
+
+def _blocks_to_draw(limits):
+    """Blocks in display order: dicts with title, pct, reset_min, group.
+    The per-model weekly block is only included when the API reported one.
+    The "Resets in" line is drawn once per reset group, under the last
+    block of that group: weekly limits (all models / Fable) reset together."""
+    blocks = [
+        dict(title="Current", group="session",
+             pct=limits.get("five_hour_pct"),
+             reset_min=limits.get("five_hour_resets_in_min")),
+        dict(title="Weekly", group="weekly",
+             pct=limits.get("seven_day_pct"),
+             reset_min=limits.get("seven_day_resets_in_min")),
+    ]
+    if limits.get("model_weekly_pct") is not None:
+        blocks.append(dict(title=limits.get("model_weekly_label") or "Model",
+                           group="weekly",
+                           pct=limits.get("model_weekly_pct"),
+                           reset_min=limits.get("model_weekly_resets_in_min")))
+    last_in_group = {b["group"]: i for i, b in enumerate(blocks)}
+    for i, b in enumerate(blocks):
+        b["show_reset"] = (last_in_group[b["group"]] == i
+                           and bool(_format_reset_long(b["reset_min"])))
+    return blocks
+
+
+def _ink_bbox(text, font):
+    """Actual rendered ink box of `text` drawn at (0, baseline) with the
+    baseline at y=font.size*2: (left, top, right, bottom) or None.
+    Font metrics from textbbox include side bearings and rounding; for
+    pixel-exact spacing we look at the pixels themselves."""
+    size = font.size
+    scratch = Image.new("L", (size * 12, size * 3), 0)
+    ImageDraw.Draw(scratch).text((0, size * 2), text, fill=255,
+                                 font=font, anchor="ls")
+    return scratch.point(lambda v: 255 if v > 200 else 0).getbbox()
+
+
+def _draw_pct(draw, x, baseline, text, font):
+    """Draw "NN%" with the "%" sign placed a fixed ink distance after the
+    digits. Font kerning makes pairs like "7%" sit tighter than "4%";
+    placing the sign by measured ink edges keeps the gap identical in
+    every block."""
+    if not text.endswith("%"):
+        draw.text((x, baseline), text, fill=COL_TEXT, font=font, anchor="ls")
+        return
+    digits = text[:-1]
+    draw.text((x, baseline), digits, fill=COL_TEXT, font=font, anchor="ls")
+    digits_ink = _ink_bbox(digits, font)
+    sign_ink = _ink_bbox("%", font)
+    if not digits_ink or not sign_ink:
+        draw.text((x, baseline), "%", fill=COL_TEXT, font=font, anchor="ls")
+        return
+    sign_x = x + digits_ink[2] + PCT_SIGN_GAP - sign_ink[0]
+    draw.text((sign_x, baseline), "%", fill=COL_TEXT, font=font, anchor="ls")
+
+
+def _text_height(draw, text, font):
+    bb = draw.textbbox((0, 0), text, font=font, anchor="ls")
+    return bb[3] - bb[1]
 
 
 def create_image(limits):
@@ -390,59 +529,71 @@ def create_image(limits):
     img = Image.new("RGB", (W, H), color=COL_BG)
     draw = ImageDraw.Draw(img)
 
-    f_title = _load_first_available_font(FONT_CANDIDATES_TITLE, 32)
-    f_pct = _load_first_available_font(FONT_CANDIDATES_BOLD, 44)
-    f_meta = _load_first_available_font(FONT_CANDIDATES_SEMIBOLD, 15)
-    f_pill = _load_first_available_font(FONT_CANDIDATES_SEMIBOLD, 13)
+    f_title = _load_first_available_font(FONT_CANDIDATES_TITLE, 24)
     f_tiny = _load_first_available_font(FONT_CANDIDATES_REGULAR, 12)
 
     # Header: mascot on the left, "Usage" centered, time on the right.
-    _draw_pixel_monster(draw, 6, 6, scale=3)
+    # Text is centred on the mascot's vertical middle by cap height so the
+    # title and the clock line up with the sprite (scale 2 -> 20 px tall,
+    # drawn at y=8, centre at HEADER_CY).
+    _draw_pixel_monster(draw, MASCOT_X, HEADER_CY - 10, scale=2)
 
     title = "Usage"
-    bbox = draw.textbbox((0, 0), title, font=f_title)
-    tw = bbox[2] - bbox[0]
-    draw.text(((W - tw) // 2, 2), title, fill=COL_TEXT, font=f_title)
+    ink = draw.textbbox((0, 0), title, font=f_title, anchor="ls")
+    cap_h = _text_height(draw, "H", f_title)
+    draw.text(((W - (ink[2] - ink[0])) // 2 - ink[0], HEADER_CY + cap_h // 2),
+              title, fill=COL_TEXT, font=f_title, anchor="ls")
 
     now = datetime.now().strftime("%H:%M")
-    bbox = draw.textbbox((0, 0), now, font=f_tiny)
-    draw.text((W - bbox[2] - 8, 16), now, fill=COL_DIM, font=f_tiny)
+    ink = draw.textbbox((0, 0), now, font=f_tiny, anchor="ls")
+    cap_h = _text_height(draw, "0", f_tiny)
+    draw.text((W - 8 - ink[2], HEADER_CY + cap_h // 2),
+              now, fill=COL_DIM, font=f_tiny, anchor="ls")
 
     if limits is None:
         draw.text((10, 110), "NO DATA", fill=COL_BAR_RED, font=f_title)
         return img
 
-    # Compute a shared width for both pills so Current/Weekly match.
+    blocks = _blocks_to_draw(limits)
+    L = LAYOUT_COMPACT if len(blocks) > 2 else LAYOUT_ROOMY
+    f_pct = _load_first_available_font(FONT_CANDIDATES_PCT, L["f_pct"])
+    f_meta = _load_first_available_font(FONT_CANDIDATES_SEMIBOLD, L["f_meta"])
+    f_pill = _load_first_available_font(FONT_CANDIDATES_SEMIBOLD, L["f_pill"])
+
+    # Shared pill width so all labels (Current/Weekly/Fable) match.
     pill_min_width = 0
-    for txt in ("Current", "Weekly"):
-        bb = draw.textbbox((0, 0), txt, font=f_pill)
+    for b in blocks:
+        bb = draw.textbbox((0, 0), b["title"], font=f_pill, anchor="ls")
         pill_min_width = max(pill_min_width, (bb[2] - bb[0]) + 20)
 
-    # Block 1: Current (5-hour rolling window)
-    block_y = 42
-    fh_pct = limits.get("five_hour_pct")
-    pct_text = f"{int(fh_pct)}%" if fh_pct is not None else "—"
-    draw.text((10, block_y), pct_text, fill=COL_TEXT, font=f_pct)
-    _draw_pill(draw, W - pill_min_width - 10, block_y + 12,
-               "Current", f_pill, min_width=pill_min_width)
-    _draw_rounded_bar(draw, 10, block_y + 48, W - 20, 16,
-                      fh_pct, _color_for_pct(fh_pct))
-    fh_reset = _format_reset_long(limits.get("five_hour_resets_in_min"))
-    if fh_reset:
-        draw.text((10, block_y + 68), fh_reset, fill=COL_TEXT, font=f_meta)
+    # Vertical flow: measure every block, spread the leftover evenly.
+    pct_h = _text_height(draw, "100%", f_pct)
+    meta_h = _text_height(draw, "Resets in 0d 0h", f_meta)
+    bar_dy = pct_h + L["pct_to_bar"]
+    heights = []
+    for b in blocks:
+        h = bar_dy + L["bar_h"]
+        if b["show_reset"]:
+            h += L["bar_to_reset"] + meta_h
+        heights.append(h)
+    leftover = BLOCKS_BOTTOM - BLOCKS_TOP - sum(heights)
+    gap = leftover / (len(blocks) - 1) if len(blocks) > 1 else 0
 
-    # Block 2: Weekly (7-day rolling window)
-    block_y = 135
-    sd_pct = limits.get("seven_day_pct")
-    pct_text = f"{int(sd_pct)}%" if sd_pct is not None else "—"
-    draw.text((10, block_y), pct_text, fill=COL_TEXT, font=f_pct)
-    _draw_pill(draw, W - pill_min_width - 10, block_y + 12,
-               "Weekly", f_pill, min_width=pill_min_width)
-    _draw_rounded_bar(draw, 10, block_y + 48, W - 20, 16,
-                      sd_pct, _color_for_pct(sd_pct))
-    sd_reset = _format_reset_long(limits.get("seven_day_resets_in_min"))
-    if sd_reset:
-        draw.text((10, block_y + 68), sd_reset, fill=COL_TEXT, font=f_meta)
+    y = BLOCKS_TOP
+    for b, h in zip(blocks, heights):
+        yi = int(round(y))
+        pct = b["pct"]
+        pct_text = f"{int(pct)}%" if pct is not None else "—"
+        _draw_pct(draw, SIDE, yi + pct_h, pct_text, f_pct)
+        _draw_pill(draw, W - pill_min_width - SIDE, yi + L["pill_dy"],
+                   b["title"], f_pill, min_width=pill_min_width)
+        _draw_rounded_bar(draw, SIDE, yi + bar_dy, W - 2 * SIDE, L["bar_h"],
+                          pct, _color_for_pct(pct))
+        if b["show_reset"]:
+            reset_y = yi + bar_dy + L["bar_h"] + L["bar_to_reset"]
+            draw.text((SIDE, reset_y + meta_h), _format_reset_long(b["reset_min"]),
+                      fill=COL_TEXT, font=f_meta, anchor="ls")
+        y += h + gap
 
     return img
 
@@ -570,6 +721,9 @@ def main():
         if limits:
             cl_str = (f"5h={limits.get('five_hour_pct')}% "
                       f"7d={limits.get('seven_day_pct')}%")
+            if limits.get("model_weekly_pct") is not None:
+                cl_str += (f" {limits.get('model_weekly_label') or 'model'}="
+                           f"{limits.get('model_weekly_pct')}%")
         else:
             cl_str = "no data"
         print(f"[{datetime.now():%H:%M:%S}] {cl_str}, uploaded={ok}")
