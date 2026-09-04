@@ -5,7 +5,7 @@ Push your [Claude.ai](https://claude.ai) usage limits to a
 sugar cube — so you can see your 5-hour and weekly quota at a glance
 without opening the Claude app.
 
-![Running on a real GeekMagic SmallTV](docs/clock-photo.jpg)
+<img src="docs/clock-photo.jpg" alt="Running on a real GeekMagic SmallTV" width="320">
 
 ## The device
 
@@ -50,7 +50,7 @@ The blocks also show time until reset ("Resets in 4h 37m", "Resets in 2d 1h").
 The weekly limits all reset at the same moment, so that line is drawn once,
 under the last weekly bar.
 
-![Rendered image](docs/preview.png)
+<img src="docs/preview.png" alt="Rendered 240×240 image" width="240">
 
 ## Why this approach?
 
